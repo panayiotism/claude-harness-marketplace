@@ -1,0 +1,248 @@
+#!/bin/bash
+# Claude Harness SessionStart Hook
+
+HARNESS_DIR="$CLAUDE_PROJECT_DIR/.claude-harness"
+[ ! -d "$HARNESS_DIR" ] && exit 0
+
+# --- Auto-run setup.sh for migrations and updates ---
+# Only runs when harness is already initialized (guard on line 5 ensures this).
+# setup.sh is idempotent: create_file skips existing files, migrations are no-op if done.
+# Output suppressed — hook status box will reflect the updated state.
+bash "$CLAUDE_PLUGIN_ROOT/setup.sh" >/dev/null 2>&1 || true
+
+# --- Reusable box formatting ---
+build_box() {
+    local TOP="┌─────────────────────────────────────────────────────────────────┐"
+    local SEP="├─────────────────────────────────────────────────────────────────┤"
+    local BOT="└─────────────────────────────────────────────────────────────────┘"
+    local out="$TOP"
+    for line in "$@"; do
+        if [ "$line" = "---" ]; then out="$out
+$SEP"
+        else out="$out
+│$(printf '%-63s' "  $line")│"
+        fi
+    done
+    echo "$out
+$BOT"
+}
+
+# --- GitHub repo caching ---
+GITHUB_OWNER=""; GITHUB_REPO=""
+REMOTE_URL=$(git remote get-url origin 2>/dev/null)
+if [ -n "$REMOTE_URL" ]; then
+    if [[ "$REMOTE_URL" =~ git@github\.com:([^/]+)/([^/.]+) ]]; then
+        GITHUB_OWNER="${BASH_REMATCH[1]}"; GITHUB_REPO="${BASH_REMATCH[2]}"
+    elif [[ "$REMOTE_URL" =~ github\.com/([^/]+)/([^/.]+) ]]; then
+        GITHUB_OWNER="${BASH_REMATCH[1]}"; GITHUB_REPO="${BASH_REMATCH[2]}"
+    fi
+    GITHUB_REPO="${GITHUB_REPO%.git}"
+fi
+
+# --- Session management ---
+SESSION_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "sess-$(date +%s%N | sha256sum | head -c 16)")
+SESSION_DIR="$HARNESS_DIR/sessions/$SESSION_ID"
+mkdir -p "$SESSION_DIR"
+cat > "$SESSION_DIR/session.json" << SESSIONEOF
+{ "id": "$SESSION_ID", "startedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "pid": "$$", "workingDir": "$CLAUDE_PROJECT_DIR" }
+SESSIONEOF
+
+# --- Stale session cleanup ---
+SESSIONS_DIR="$HARNESS_DIR/sessions"; RECOVERY_DIR="$SESSIONS_DIR/.recovery"; CLEANED_COUNT=0
+if [ -d "$SESSIONS_DIR" ]; then
+    for sd in "$SESSIONS_DIR"/*/; do
+        [ -d "$sd" ] || continue
+        sid=$(basename "$sd"); [ "$sid" = "$SESSION_ID" ] && continue; [ "$sid" = ".recovery" ] && continue
+        sf="$sd/session.json"; [ -f "$sf" ] || continue
+        pid=$(grep '"pid"' "$sf" 2>/dev/null | grep -o '[0-9]\+')
+        if [ -z "$pid" ] || ! ps -p "$pid" > /dev/null 2>&1; then
+            lf="$sd/loop-state.json"
+            if [ -f "$lf" ]; then
+                ls=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' "$lf" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+                if [ "$ls" = "in_progress" ]; then
+                    lfeat=$(grep -o '"feature"[[:space:]]*:[[:space:]]*"[^"]*"' "$lf" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+                    latmp=$(grep -o '"attempt"[[:space:]]*:[[:space:]]*[0-9]*' "$lf" 2>/dev/null | head -1 | sed 's/.*: *\([0-9]*\).*/\1/')
+                    lphase=$(grep -o '"phase"[[:space:]]*:[[:space:]]*"[^"]*"' "$lf" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+                    mkdir -p "$RECOVERY_DIR"
+                    cat > "$RECOVERY_DIR/interrupted.json" << INTEOF
+{ "version":1, "interruptedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)", "staleSessionId":"$sid", "feature":"$lfeat", "attemptAtInterrupt":${latmp:-1}, "tddPhase":"${lphase:-null}", "reason":"stale-session-detected" }
+INTEOF
+                    cp "$lf" "$RECOVERY_DIR/loop-state.json" 2>/dev/null
+                    [ -f "$sd/autonomous-state.json" ] && cp "$sd/autonomous-state.json" "$RECOVERY_DIR/autonomous-state.json" 2>/dev/null
+                fi
+            fi
+            rm -rf "$sd"; CLEANED_COUNT=$((CLEANED_COUNT + 1))
+        fi
+    done
+fi
+
+# --- Version & update check ---
+PLUGIN_VERSION=$(grep '"version"' "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null | sed 's/.*: *"\([^"]*\)".*/\1/')
+
+# Lightweight GitHub version check (cached 24h, non-blocking)
+UPDATE_AVAILABLE=""
+UPDATE_VERSION=""
+VERSION_CACHE="$HARNESS_DIR/sessions/.version-cache"
+CACHE_MAX_AGE=86400  # 24 hours
+if [ -n "$GITHUB_OWNER" ] && [ -n "$GITHUB_REPO" ]; then
+    CACHE_VALID=false
+    if [ -f "$VERSION_CACHE" ]; then
+        CACHE_AGE=$(( $(date +%s) - $(stat -c %Y "$VERSION_CACHE" 2>/dev/null || echo 0) ))
+        [ "$CACHE_AGE" -lt "$CACHE_MAX_AGE" ] && CACHE_VALID=true
+    fi
+    if [ "$CACHE_VALID" = true ]; then
+        LATEST_VERSION=$(cat "$VERSION_CACHE" 2>/dev/null)
+    else
+        # Quick API check with 3s timeout - fail silently on network error
+        LATEST_VERSION=$(curl -sf --max-time 3 \
+            "https://raw.githubusercontent.com/$GITHUB_OWNER/$GITHUB_REPO/main/.claude-plugin/plugin.json" 2>/dev/null \
+            | grep '"version"' | sed 's/.*: *"\([^"]*\)".*/\1/')
+        if [ -n "$LATEST_VERSION" ]; then
+            mkdir -p "$(dirname "$VERSION_CACHE")"
+            echo "$LATEST_VERSION" > "$VERSION_CACHE"
+        fi
+    fi
+    if [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "$PLUGIN_VERSION" ]; then
+        UPDATE_AVAILABLE="true"
+        UPDATE_VERSION="$LATEST_VERSION"
+    fi
+fi
+
+# --- Memory status ---
+
+EPISODIC_COUNT=0; FAILURES_COUNT=0; SUCCESSES_COUNT=0; RULES_COUNT=0; WORKING_COMPUTED=""; IS_V3=false
+if [ -d "$HARNESS_DIR/memory" ]; then
+    IS_V3=true
+    [ -f "$HARNESS_DIR/memory/working/context.json" ] && WORKING_COMPUTED=$(grep -o '"computedAt"[[:space:]]*:[[:space:]]*"[^"]*"' "$HARNESS_DIR/memory/working/context.json" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+    [ -f "$HARNESS_DIR/memory/episodic/decisions.json" ] && EPISODIC_COUNT=$(grep -c '"id"' "$HARNESS_DIR/memory/episodic/decisions.json" 2>/dev/null || echo "0")
+    [ -f "$HARNESS_DIR/memory/procedural/failures.json" ] && FAILURES_COUNT=$(grep -c '"id"' "$HARNESS_DIR/memory/procedural/failures.json" 2>/dev/null || echo "0")
+    [ -f "$HARNESS_DIR/memory/procedural/successes.json" ] && SUCCESSES_COUNT=$(grep -c '"id"' "$HARNESS_DIR/memory/procedural/successes.json" 2>/dev/null || echo "0")
+    [ -f "$HARNESS_DIR/memory/learned/rules.json" ] && RULES_COUNT=$(grep -c '"id"' "$HARNESS_DIR/memory/learned/rules.json" 2>/dev/null || echo "0")
+fi
+
+FEATURES_FILE="$HARNESS_DIR/features/active.json"; AGENT_FILE="$HARNESS_DIR/agents/context.json"
+LOOP_FILE="$SESSION_DIR/loop-state.json"; WORKING_FILE="$SESSION_DIR/context.json"
+
+ACTIVE_FEATURE=""; FEATURE_SUMMARY=""
+if [ -f "$WORKING_FILE" ]; then
+    ACTIVE_FEATURE=$(grep -o '"activeFeature"[[:space:]]*:[[:space:]]*"[^"]*"' "$WORKING_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+    FEATURE_SUMMARY=$(grep -o '"summary"[[:space:]]*:[[:space:]]*"[^"]*"' "$WORKING_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+fi
+
+TOTAL_FEATURES=0; PENDING_FEATURES=0; IN_PROGRESS=0; NEEDS_TESTS=0
+if [ -f "$FEATURES_FILE" ]; then
+    TOTAL_FEATURES=$(grep -c '"id"' "$FEATURES_FILE" 2>/dev/null | head -1 || echo "0")
+    PENDING_FEATURES=$(grep -c '"status"[[:space:]]*:[[:space:]]*"pending"' "$FEATURES_FILE" 2>/dev/null | head -1 || echo "0")
+    IN_PROGRESS=$(grep -c '"status"[[:space:]]*:[[:space:]]*"in_progress"' "$FEATURES_FILE" 2>/dev/null | head -1 || echo "0")
+    NEEDS_TESTS=$(grep -c '"status"[[:space:]]*:[[:space:]]*"needs_tests"' "$FEATURES_FILE" 2>/dev/null | head -1 || echo "0")
+fi
+
+ORCH_FEATURE=""; ORCH_PHASE=""
+if [ -f "$AGENT_FILE" ]; then
+    ORCH_FEATURE=$(grep -o '"activeFeature"[[:space:]]*:[[:space:]]*"[^"]*"' "$AGENT_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+    ORCH_PHASE=$(grep -o '"orchestrationPhase"[[:space:]]*:[[:space:]]*"[^"]*"' "$AGENT_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+fi
+
+LOOP_FEATURE=""; LOOP_STATUS=""; LOOP_ATTEMPT=""; LOOP_MAX=""
+if [ -f "$LOOP_FILE" ]; then
+    LOOP_STATUS=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' "$LOOP_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+    if [ "$LOOP_STATUS" = "in_progress" ]; then
+        LOOP_FEATURE=$(grep -o '"feature"[[:space:]]*:[[:space:]]*"[^"]*"' "$LOOP_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+        LOOP_ATTEMPT=$(grep -o '"attempt"[[:space:]]*:[[:space:]]*[0-9]*' "$LOOP_FILE" 2>/dev/null | head -1 | sed 's/.*: *\([0-9]*\).*/\1/')
+        LOOP_MAX=$(grep -o '"maxAttempts"[[:space:]]*:[[:space:]]*[0-9]*' "$LOOP_FILE" 2>/dev/null | head -1 | sed 's/.*: *\([0-9]*\).*/\1/')
+    fi
+fi
+
+INT_FEATURE=""; INT_ATTEMPT=""; INT_PHASE=""
+if [ -f "$RECOVERY_DIR/interrupted.json" ]; then
+    INT_FEATURE=$(grep -o '"feature"[[:space:]]*:[[:space:]]*"[^"]*"' "$RECOVERY_DIR/interrupted.json" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+    INT_ATTEMPT=$(grep -o '"attemptAtInterrupt"[[:space:]]*:[[:space:]]*[0-9]*' "$RECOVERY_DIR/interrupted.json" 2>/dev/null | head -1 | sed 's/.*: *\([0-9]*\).*/\1/')
+    INT_PHASE=$(grep -o '"tddPhase"[[:space:]]*:[[:space:]]*"[^"]*"' "$RECOVERY_DIR/interrupted.json" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+fi
+
+LAST_SUMMARY=""
+[ -f "$HARNESS_DIR/claude-progress.json" ] && LAST_SUMMARY=$(grep -o '"summary"[[:space:]]*:[[:space:]]*"[^"]*"' "$HARNESS_DIR/claude-progress.json" 2>/dev/null | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+
+# --- Build user-visible message ---
+LOOP_LINE=""
+if [ -n "$INT_FEATURE" ]; then
+    LOOP_LINE="INTERRUPTED: $INT_FEATURE (attempt $INT_ATTEMPT, phase: ${INT_PHASE:-unknown})"
+    LOOP_FEATURE="$INT_FEATURE"
+elif [ -n "$LOOP_FEATURE" ] && [ "$LOOP_STATUS" = "in_progress" ]; then
+    LOOP_LINE="ACTIVE LOOP: $LOOP_FEATURE (attempt $LOOP_ATTEMPT/$LOOP_MAX)"
+fi
+
+STATUS_LINE="P:$PENDING_FEATURES WIP:$IN_PROGRESS Tests:$NEEDS_TESTS"
+[ -n "$ACTIVE_FEATURE" ] && [ "$ACTIVE_FEATURE" != "null" ] && STATUS_LINE="$STATUS_LINE | Active: $ACTIVE_FEATURE"
+[ -n "$ORCH_FEATURE" ] && [ "$ORCH_FEATURE" != "null" ] && [ "$ORCH_PHASE" != "completed" ] && STATUS_LINE="$STATUS_LINE | Orch: $ORCH_PHASE"
+
+BOX_LINES=("CLAUDE HARNESS v$PLUGIN_VERSION")
+if [ -n "$LOOP_LINE" ]; then
+    BOX_LINES+=("---" "$LOOP_LINE" "Resume: /claude-harness:flow $LOOP_FEATURE")
+fi
+BOX_LINES+=("---" "$STATUS_LINE")
+[ "$IS_V3" = true ] && BOX_LINES+=("Memory: $EPISODIC_COUNT decisions | $FAILURES_COUNT failures | $RULES_COUNT rules")
+if [ "$UPDATE_AVAILABLE" = "true" ]; then
+    BOX_LINES+=("---" "UPDATE: v$UPDATE_VERSION available (current: v$PLUGIN_VERSION)" "Run: claude plugin update claude-harness")
+fi
+BOX_LINES+=("---" "/claude-harness:flow        Unified workflow (recommended)" "Flags: --no-merge --plan-only --autonomous --quick --fix")
+
+USER_MSG=$(build_box "${BOX_LINES[@]}")
+
+# --- Build Claude context ---
+CLAUDE_CONTEXT="=== CLAUDE HARNESS SESSION (v$PLUGIN_VERSION) ==="
+CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\nSession ID: $SESSION_ID\nSession Dir: .claude-harness/sessions/$SESSION_ID/\nPlugin Root: $CLAUDE_PLUGIN_ROOT"
+
+if [ -n "$GITHUB_OWNER" ] && [ -n "$GITHUB_REPO" ]; then
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n=== GITHUB (CACHED) ===\nOwner: $GITHUB_OWNER\nRepo: $GITHUB_REPO\nIMPORTANT: Use these cached values for ALL GitHub API calls. Do NOT re-parse git remote."
+fi
+
+if [ "$IS_V3" = true ]; then
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n=== MEMORY ARCHITECTURE v3.0 ==="
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nEpisodic Memory: $EPISODIC_COUNT decisions recorded"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nProcedural Memory: $FAILURES_COUNT failures, $SUCCESSES_COUNT successes"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nLearned Rules: $RULES_COUNT rules from user corrections"
+    [ -n "$WORKING_COMPUTED" ] && CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nWorking Context: Last compiled $WORKING_COMPUTED" \
+        || CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nWorking Context: Not compiled - run /start"
+fi
+
+[ -n "$ACTIVE_FEATURE" ] && [ "$ACTIVE_FEATURE" != "null" ] && \
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\nRESUMING WORK:\nFeature: $ACTIVE_FEATURE\nSummary: $FEATURE_SUMMARY"
+[ "$TOTAL_FEATURES" != "0" ] && \
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\nFeatures: P:$PENDING_FEATURES WIP:$IN_PROGRESS Tests:$NEEDS_TESTS / $TOTAL_FEATURES total"
+
+if [ -n "$INT_FEATURE" ]; then
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n*** INTERRUPTED SESSION DETECTED ***"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nFeature: $INT_FEATURE was interrupted at attempt $INT_ATTEMPT\nTDD Phase: ${INT_PHASE:-null}"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nRecovery: .claude-harness/sessions/.recovery/interrupted.json\nResume: /claude-harness:flow $INT_FEATURE\nIMPORTANT: On resume, flow will offer recovery options. Do NOT retry same approach blindly."
+fi
+
+[ -n "$LOOP_FEATURE" ] && [ "$LOOP_STATUS" = "in_progress" ] && \
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n*** ACTIVE AGENTIC LOOP ***\nFeature: $LOOP_FEATURE\nAttempt: $LOOP_ATTEMPT of $LOOP_MAX\nStatus: In Progress"
+[ -n "$ORCH_FEATURE" ] && [ "$ORCH_FEATURE" != "null" ] && [ "$ORCH_PHASE" != "completed" ] && \
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\nACTIVE ORCHESTRATION:\nFeature: $ORCH_FEATURE\nPhase: $ORCH_PHASE"
+[ -n "$LAST_SUMMARY" ] && CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\nLast session: $LAST_SUMMARY"
+if [ "$UPDATE_AVAILABLE" = "true" ]; then
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n*** PLUGIN UPDATE AVAILABLE ***"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nInstalled: v$PLUGIN_VERSION | Latest: v$UPDATE_VERSION"
+    CLAUDE_CONTEXT="$CLAUDE_CONTEXT\nUpdate: /plugin update claude-harness"
+fi
+CLAUDE_CONTEXT="$CLAUDE_CONTEXT\n\n*** PARALLEL SESSIONS ENABLED ***\nThis session has its own state directory. Multiple Claude instances can work on different features simultaneously without conflicts."
+
+# --- Output JSON ---
+USER_MSG_ESCAPED=$(echo "$USER_MSG" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+CLAUDE_CONTEXT_ESCAPED=$(echo -e "$CLAUDE_CONTEXT" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+
+cat << EOF
+{
+  "continue": true,
+  "systemMessage": "$USER_MSG_ESCAPED",
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "sessionId": "$SESSION_ID",
+    "sessionDir": "$SESSION_DIR",
+    "github": { "owner": "$GITHUB_OWNER", "repo": "$GITHUB_REPO" },
+    "additionalContext": "$CLAUDE_CONTEXT_ESCAPED"
+  }
+}
+EOF
