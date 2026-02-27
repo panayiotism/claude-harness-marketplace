@@ -1,0 +1,10 @@
+.claude/settings.local.json
+*.log
+.DS_Store
+
+# Claude Harness - Project-specific state (created by setup.sh at runtime, not part of plugin)
+.claude-harness/
+
+# Dev-only files (not part of plugin)
+tests/
+RELEASES/
