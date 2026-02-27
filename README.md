@@ -19,21 +19,16 @@ cd your-project && claude
 ## Updating
 
 ```bash
-# Refresh the marketplace cache, then update the plugin
-claude plugin marketplace update claude-harness
 claude plugin update claude-harness@claude-harness
 ```
 
-Both steps are required — `plugin update` checks a local cache that doesn't auto-refresh.
-
-> **Important**: The full `claude-harness@claude-harness` identifier is required.
-> `claude plugin update claude-harness` (without `@claude-harness`) will fail with "not found".
+> **Note**: The full `claude-harness@claude-harness` identifier is required.
 
 ## Troubleshooting
 
-### Plugin update says "already at latest" but a newer version exists
+### Plugin update not detected
 
-Claude Code caches marketplace data locally. Force-refresh it first:
+Force-refresh the marketplace cache, then update:
 
 ```bash
 claude plugin marketplace update claude-harness
