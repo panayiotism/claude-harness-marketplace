@@ -14,7 +14,7 @@
       "description": "Long-running agent harness with 5-layer memory, GitHub integration, autonomous batch processing, Agent Teams with ATDD",
       "category": "development",
       "homepage": "https://github.com/panayiotism/claude-harness",
-      "version": "10.2.1",
+      "version": "10.2.2",
       "strict": true
     }
   ]
