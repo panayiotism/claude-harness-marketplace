@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-harness",
   "metadata": {
-    "description": "Claude Code agent harness with 5-layer memory, test-driven features, and autonomous batch processing"
+    "description": "Claude Code agent harness with 5-layer memory, ATDD workflows, and autonomous batch processing"
   },
   "owner": {
     "name": "panayiotis"
@@ -11,8 +11,13 @@
     {
       "name": "claude-harness",
       "source": "./plugins/claude-harness",
-      "description": "Long-running agent harness with 5-layer memory, GitHub integration, autonomous batch processing, Agent Teams with ATDD",
+      "description": "Long-running agent harness with 5-layer memory architecture, GitHub integration via gh CLI, autonomous batch processing with a dedicated implementer subagent, Agent Teams with ATDD, quality-gate hooks, and 6 Agent Skills",
       "category": "development",
+      "author": {
+        "name": "panayiotis"
+      },
+      "license": "MIT",
+      "keywords": ["workflow", "memory", "autonomous", "atdd", "github", "agent-teams"],
       "homepage": "https://github.com/panayiotism/claude-harness",
       "strict": true
     }
